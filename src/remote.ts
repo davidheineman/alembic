@@ -113,6 +113,13 @@ export class RemotePool {
       .then(poll);
   }
 
+  /** The page is going away: unpins the GPU without stopping it. It exits after ~20 s without runs
+   * unless a reloaded page pins it again first, which then gets the warm container back. */
+  leave() {
+    if (!this.on) return;
+    void fetch(`${URL_}/warm`, { method: 'POST', headers, body: JSON.stringify({ gpus: 0, leaving: true }), keepalive: true }).catch(() => {});
+  }
+
   touch() {
     this.lastActive = Date.now();
   }

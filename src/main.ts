@@ -280,7 +280,7 @@ const pool = new RemotePool(() => {
   poolInfo.style.display = text ? '' : 'none';
 });
 poolInfo.style.display = 'none';
-addEventListener('pagehide', () => pool.stop());
+addEventListener('pagehide', () => pool.leave());
 if (remoteAvailable && localStorage.getItem('backend') === 'remote') {
   backend = 'remote';
   pool.start(false);

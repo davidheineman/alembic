@@ -297,7 +297,9 @@ def api():
         if want or pool.get("want"):
             # Re-applied on every heartbeat: a redeploy resets min_containers to the decorator's value.
             await asyncio.to_thread(set_pool, want)
-        if not want:
+        if not want and not body.get("leaving"):
+            # Leaving (page closed or reloading) only unpins: the container exits IDLE_GPU_SHUTDOWN_S
+            # after its last run, and a reloaded page gets it back warm.
             await asyncio.to_thread(shut_down)
         await asyncio.to_thread(state.put, "pool", {"want": want, "hb": now, "since": pool.get("since", now)})
         return await asyncio.to_thread(pool_status, want)

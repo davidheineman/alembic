@@ -29,22 +29,28 @@ export interface GpuDataset {
   test: GpuSplit;
 }
 
-async function fetchWithProgress(url: string, onProgress: (frac: number) => void): Promise<Uint8Array> {
+// Sized from the known file size rather than Content-Length: servers that gzip (GitHub Pages does)
+// report the compressed length, while the stream yields decompressed bytes.
+async function fetchWithProgress(url: string, size: number, onProgress: (frac: number) => void): Promise<Uint8Array> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Failed to fetch ${url} (${resp.status}). Run \`npm run get-data\` first.`);
-  const total = Number(resp.headers.get('content-length')) || 0;
-  if (!resp.body || !total) return new Uint8Array(await resp.arrayBuffer());
-  const out = new Uint8Array(total);
+  if (!resp.body) return new Uint8Array(await resp.arrayBuffer());
+  let out = new Uint8Array(size);
   const reader = resp.body.getReader();
   let got = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (got + value.length > out.length) {
+      const bigger = new Uint8Array(Math.max(out.length * 2, got + value.length));
+      bigger.set(out.subarray(0, got));
+      out = bigger;
+    }
     out.set(value, got);
     got += value.length;
-    onProgress(got / total);
+    onProgress(Math.min(1, got / size));
   }
-  return out;
+  return out.subarray(0, got);
 }
 
 function parse(bytes: Uint8Array): CpuSplit {
@@ -64,8 +70,8 @@ export async function loadCifar(onProgress: (msg: string) => void): Promise<Cifa
   let b = 0;
   const report = () => onProgress(`Downloading CIFAR-10… ${Math.round(((a * 5 + b) / 6) * 100)}%`);
   const [trainBytes, testBytes] = await Promise.all([
-    fetchWithProgress(base + 'cifar10_train.bin', (f) => ((a = f), report())),
-    fetchWithProgress(base + 'cifar10_test.bin', (f) => ((b = f), report())),
+    fetchWithProgress(base + 'cifar10_train.bin', 50000 * REC, (f) => ((a = f), report())),
+    fetchWithProgress(base + 'cifar10_test.bin', 10000 * REC, (f) => ((b = f), report())),
   ]);
   onProgress('Parsing…');
   return { train: parse(trainBytes), test: parse(testBytes) };
