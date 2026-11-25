@@ -704,7 +704,6 @@ function onConfigChanged() {
   const L = buildLayout(cfg.model, 3 * cfg.data.resolution ** 2);
   renderSchematic(schematicEl, cfg.model, L, setModel);
   sweepInfoUpdate();
-  scalingInfoUpdate();
 }
 
 // ============================================================================
@@ -1360,7 +1359,6 @@ const scalingTab = document.getElementById('tab-scaling')!;
 const scaleState = { widths: '16, 32, 64, 128, 256, 512', source: 'test' as 'test' | 'train', skip: 25, evals: 20 };
 let lastScaling: string | null = null;
 let scaleCounter = 0;
-const scaleInfo = h('div', { class: 'info' });
 const widthsInput = h('input', { class: 'grow', type: 'text' });
 widthsInput.addEventListener('change', () => ((scaleState.widths = widthsInput.value), sync()));
 updaters.push(() => (widthsInput.value = scaleState.widths));
@@ -1377,12 +1375,6 @@ function scalingConfigs(): TrainConfig[] {
       c.logEvals = true;
       return c;
     });
-}
-
-function scalingInfoUpdate() {
-  const cs = scalingConfigs();
-  const parts = cs.map((c) => `d=${c.model.width}: ${formatCount(buildLayout(c.model, 3 * c.data.resolution ** 2).numParams)}`);
-  scaleInfo.textContent = `${cs.length} models (depth ${cfg.model.depth}, ${cfg.budget} ${cfg.budgetUnit} each). Params: ${parts.join(', ')}`;
 }
 
 function runScaling() {
@@ -1428,12 +1420,6 @@ scalingTab.append(
     ),
     row('Eval points', num(() => scaleState.evals, (v) => (scaleState.evals = v), { min: 4, max: 200, int: true }), h('span', { class: 'muted' }, 'log-spaced per run')),
     h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => runScaling() }, '▶ Run scaling sweep'), h('button', { onclick: () => stopAll() }, '■ Stop')),
-    scaleInfo,
-    h(
-      'div',
-      { class: 'info' },
-      'Each model trains with the sidebar settings. We take the lower envelope of loss over all runs as a function of compute (the compute-efficient frontier) and fit a straight line in log-log space.',
-    ),
   ),
   fitText,
   scaleWrap,

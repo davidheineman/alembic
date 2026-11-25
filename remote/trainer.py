@@ -250,6 +250,11 @@ class Model:
     running: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     precision: str = "fp32"
 
+    def to(self, device) -> "Model":
+        self.params = {k: v.detach().to(device).requires_grad_(True) for k, v in self.params.items()}
+        self.running = {k: (m.to(device), v.to(device)) for k, (m, v) in self.running.items()}
+        return self
+
     def specs(self) -> list[Spec]:
         m = self.cfg
         d = m["width"]
@@ -846,6 +851,8 @@ def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s:
     bit-identical to solo runs with CUBLAS_WORKSPACE_CONFIG=:0:0 (see modal_app.py).
     """
     cuda = device == "cuda"
+    # Generating the initial weights is ~15 ms of CPU; outside the lock, concurrent runs do it in parallel.
+    fresh = init_model(cfg["model"], 3 * cfg["data"]["resolution"] ** 2, cfg["initSeed"], "cpu")
     with _waiting:
         _gpu_lock.acquire()
     try:
@@ -856,16 +863,14 @@ def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s:
         skey, B, micro, precision = _session_key(cfg, ds)
         pure_bf16 = precision == "bf16"
         T = total_steps(cfg)
-        mc = cfg["model"]
         sampler = Sampler(ds.n_train, cfg["dataSeed"], cfg["data"]["flip"])
         eval_steps = set(eval_schedule(T, cfg["numEvals"], bool(cfg.get("logEvals"))))
         evals_host = torch.zeros(2, len(eval_steps), 2, pin_memory=cuda)
         evals_dev = torch.zeros(2, len(eval_steps), 2, device=device)
 
         sess = _take_session(skey) if cuda and use_graphs else None
-        fresh = init_model(mc, ds.D, cfg["initSeed"], device)
         if sess is None:
-            sess = _new_session(fresh, cfg, ds, B, micro, precision, device)
+            sess = _new_session(fresh.to(device), cfg, ds, B, micro, precision, device)
             _live[skey] = _live.get(skey, 0) + 1
         else:
             sess.reset(fresh)
