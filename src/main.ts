@@ -544,8 +544,6 @@ side.append(
 function modelWarnings(): string {
   const w: string[] = [];
   const m = cfg.model;
-  if (m.init === 'zero')
-    w.push('0-init: every hidden unit is identical and the residual stream is exactly zero, so only the head bias receives gradient. Expect the loss to stall at ≈ class-prior entropy (ln 10 ≈ 2.30).');
   const bn = ((m.preNorm && m.norm === 'batchnorm') || (m.postNorm && postNormKind(m) === 'batchnorm')) && m.depth > 0;
   if (bn && effectiveBatch(cfg) === 1) w.push('BatchNorm with batch size 1 normalizes every feature to 0, so the network output is constant.');
   if (bn && (effectiveBatch(cfg) > 1024 || (cfg.microBatches ?? 0) > 1)) w.push('Batches > 1024 are split into micro-batches; BatchNorm uses per-micro-batch ("ghost") statistics.');

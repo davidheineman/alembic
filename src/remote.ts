@@ -199,7 +199,7 @@ export class RemotePool {
 }
 
 type Msg =
-  | { type: 'queued' | 'ping' }
+  | { type: 'queued' | 'ping' | 'retry' }
   | { type: 'start'; gpu: string }
   | { type: 'update'; step: number; totalSteps: number; train: (number | null)[][]; evals: (number | null)[][]; stepsPerSec: number; diverged: boolean; util?: number }
   | { type: 'final'; stemW: string }
@@ -221,9 +221,20 @@ export class RemoteRun {
     void fetch(`${URL_}/cancel`, { method: 'POST', headers, body: JSON.stringify({ runIds: [this.id] }), keepalive: true }).catch(() => {});
   }
 
-  /** Resolves when training finishes or is stopped; rejects on server errors. */
-  /** onUtil gets the GPU's utilization (%) as reported alongside each update. */
+  /** Resolves when training finishes or is stopped; rejects on server errors. onUtil gets the GPU's
+   * utilization (%) as reported alongside each update. */
   async run(onStart: (gpu: string) => void, onUpdate: (u: ChunkUpdate) => void, onUtil?: (pct: number) => void): Promise<void> {
+    // A request can land on a GPU container that is shutting down; it says so and the next try
+    // reaches (or starts) a fresh one.
+    for (let i = 0; i < 5; i++) {
+      if (!(await this.attempt(onStart, onUpdate, onUtil)) || this.stopped) return;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    throw new Error('remote backend: GPU kept shutting down');
+  }
+
+  /** True if the run should be resent. */
+  private async attempt(onStart: (gpu: string) => void, onUpdate: (u: ChunkUpdate) => void, onUtil?: (pct: number) => void): Promise<boolean> {
     let res: Response;
     try {
       res = await fetch(`${TRAIN_URL}/train`, {
@@ -235,7 +246,7 @@ export class RemoteRun {
         signal: this.ctrl.signal,
       });
     } catch (e) {
-      if (this.stopped) return;
+      if (this.stopped) return false;
       throw e;
     }
     if (!res.ok || !res.body) throw new Error(`remote backend: HTTP ${res.status} ${await res.text()}`);
@@ -255,6 +266,7 @@ export class RemoteRun {
           buf = buf.slice(nl + 1);
           if (!line.trim()) continue;
           const m = JSON.parse(line) as Msg;
+          if (m.type === 'retry') return true;
           if (m.type === 'start') onStart(m.gpu);
           else if (m.type === 'error') throw new Error(`remote backend: ${m.error}`);
           else if (m.type === 'update') {
@@ -277,8 +289,9 @@ export class RemoteRun {
         }
       }
     } catch (e) {
-      if (this.stopped) return;
+      if (this.stopped) return false;
       throw e;
     }
+    return false;
   }
 }
