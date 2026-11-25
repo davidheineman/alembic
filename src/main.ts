@@ -1781,7 +1781,7 @@ function updateLive() {
   }
   if (!current) {
     progressBar.style.width = '0';
-    liveInfo.textContent = runs.length ? 'idle' : 'idle — press Train';
+    liveInfo.textContent = 'idle';
     return;
   }
   const r = current.run;
