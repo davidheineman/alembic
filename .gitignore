@@ -1,0 +1,5 @@
+node_modules
+dist
+public/data/*.bin
+.env.local
+remote/__pycache__
