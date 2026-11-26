@@ -9,6 +9,8 @@
   --orange: #ffaa3c;
   --red: #ff6b6b;
   --green: #4fd18b;
+  color-scheme: dark;
+  scrollbar-color: #333944 var(--bg);
 }
 
 * {

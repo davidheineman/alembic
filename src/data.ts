@@ -54,6 +54,24 @@ async function fetchWithProgress(url: string, size: number, onProgress: (frac: n
   return out.subarray(0, got);
 }
 
+// Kept in Cache Storage so later visits skip the ~180 MB download; bump the name if the files change.
+const DATA_CACHE = 'cifar10-v1';
+
+async function cachedFetch(url: string, size: number, onProgress: (frac: number) => void): Promise<Uint8Array> {
+  const cache = 'caches' in globalThis ? await caches.open(DATA_CACHE).catch(() => null) : null;
+  const hit = await cache?.match(url).catch(() => undefined);
+  if (hit) {
+    const bytes = new Uint8Array(await hit.arrayBuffer());
+    if (bytes.length === size) {
+      onProgress(1);
+      return bytes;
+    }
+  }
+  const bytes = await fetchWithProgress(url, size, onProgress);
+  if (cache && bytes.length === size) cache.put(url, new Response(bytes)).catch(() => {}); // e.g. over storage quota
+  return bytes;
+}
+
 function parse(bytes: Uint8Array): CpuSplit {
   const N = Math.floor(bytes.length / REC);
   const labels = new Uint8Array(N);
@@ -71,8 +89,8 @@ export async function loadCifar(onProgress: (msg: string) => void): Promise<Cifa
   let b = 0;
   const report = () => onProgress(`Downloading CIFAR-10… ${Math.round(((a * 5 + b) / 6) * 100)}%`);
   const [trainBytes, testBytes] = await Promise.all([
-    fetchWithProgress(base + 'cifar10_train.bin', 50000 * REC, (f) => ((a = f), report())),
-    fetchWithProgress(base + 'cifar10_test.bin', 10000 * REC, (f) => ((b = f), report())),
+    cachedFetch(base + 'cifar10_train.bin', 50000 * REC, (f) => ((a = f), report())),
+    cachedFetch(base + 'cifar10_test.bin', 10000 * REC, (f) => ((b = f), report())),
   ]);
   onProgress('Parsing…');
   return { train: parse(trainBytes), test: parse(testBytes) };
