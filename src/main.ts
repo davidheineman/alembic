@@ -155,7 +155,7 @@ function backendSeg(el: HTMLElement): HTMLElement {
   const b = el.lastElementChild as HTMLButtonElement;
   b.classList.add('unavailable');
   b.title = '';
-  const tip = (e: MouseEvent) => showTip(e.clientX, e.clientY, [{ text: 'Run this locally to use Modal for GPUs' }]);
+  const tip = (e: MouseEvent) => showTip(e.clientX, e.clientY, [{ text: 'Run this repo locally to use Modal for GPUs' }]);
   b.addEventListener('mouseenter', tip);
   b.addEventListener('mousemove', tip);
   b.addEventListener('mouseleave', hideTip);
