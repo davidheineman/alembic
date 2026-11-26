@@ -53,6 +53,7 @@ function resetConfig() {
   Object.assign(cfg, structuredClone(DEFAULT_CFG), { schedule });
   schedEditor.set(presetSchedule('warmup-cosine'));
   rerollSeeds = true;
+  numSeeds = 1;
   sync();
 }
 type Status = 'queued' | 'running' | 'done' | 'diverged' | 'stopped' | 'error';
@@ -257,6 +258,8 @@ function info(fn: () => string, cls = 'info'): HTMLDivElement {
 const side = document.getElementById('side')!;
 
 let rerollSeeds = true;
+const MAX_SEEDS = 16;
+let numSeeds = 1;
 const trainBtn = h('button', { class: 'primary', onclick: () => trainSingle() }, '▶ Train');
 const stopBtn = h('button', { class: 'danger', onclick: () => stopAll() }, '■ Stop');
 const progressBar = h('div');
@@ -339,22 +342,33 @@ runSection.classList.add('pinned');
 side.append(runSection);
 
 // --- Seeds
-side.append(
-  section(
-    'Random Seed',
-    row(
-      'Init seed',
-      num(() => cfg.initSeed, (v) => (cfg.initSeed = v), { int: true, min: 0 }),
-      h('button', { onclick: () => ((cfg.initSeed = Math.floor(Math.random() * 10000)), sync()), title: 'Random seed' }, '🎲'),
-    ),
-    row(
-      'Data seed',
-      num(() => cfg.dataSeed, (v) => (cfg.dataSeed = v), { int: true, min: 0 }),
-      h('button', { onclick: () => ((cfg.dataSeed = Math.floor(Math.random() * 10000)), sync()), title: 'Random seed' }, '🎲'),
-    ),
-    row('', check('new seeds every run', () => rerollSeeds, (v) => (rerollSeeds = v), 'Roll both seeds each time you press Train')),
+const seedsRange = h('input', { type: 'range', min: 1, max: MAX_SEEDS, step: 1, class: 'grow', title: 'Runs per Train press, each with its own random init and data seeds' });
+seedsRange.addEventListener('input', () => ((numSeeds = +seedsRange.value), sync()));
+const seedsLbl = h('span', { class: 'info', style: 'width:38px;text-align:right' });
+// With several seeds every run rolls its own, so the fixed choices don't apply.
+const seedChoices = h(
+  'div',
+  {},
+  row(
+    'Init seed',
+    num(() => cfg.initSeed, (v) => (cfg.initSeed = v), { int: true, min: 0 }),
+    h('button', { onclick: () => ((cfg.initSeed = Math.floor(Math.random() * 10000)), sync()), title: 'Random seed' }, '🎲'),
   ),
+  row(
+    'Data seed',
+    num(() => cfg.dataSeed, (v) => (cfg.dataSeed = v), { int: true, min: 0 }),
+    h('button', { onclick: () => ((cfg.dataSeed = Math.floor(Math.random() * 10000)), sync()), title: 'Random seed' }, '🎲'),
+  ),
+  row('', check('new seeds every run', () => rerollSeeds, (v) => (rerollSeeds = v), 'Roll both seeds each time you press Train')),
 );
+updaters.push(() => {
+  seedsRange.value = String(numSeeds);
+  seedsLbl.textContent = String(numSeeds);
+  const fixed = numSeeds > 1;
+  seedChoices.classList.toggle('dimmed', fixed);
+  seedChoices.querySelectorAll('input, button').forEach((el) => ((el as HTMLInputElement).disabled = fixed));
+});
+side.append(section('Random Seed', row('Seeds', seedsRange, seedsLbl), seedChoices));
 
 // --- Data
 const EPOCH_STOPS = [0.1, 0.25, 0.5, 1, 2, 3, 5, 10, 20, 30, 50, 100];
@@ -1612,14 +1626,21 @@ function makeRun(c: TrainConfig, o: { group?: string; color?: string; label?: st
 }
 
 function trainSingle() {
-  if (rerollSeeds) {
+  if (rerollSeeds || numSeeds > 1) {
     cfg.initSeed = Math.floor(Math.random() * 10000);
     cfg.dataSeed = Math.floor(Math.random() * 10000);
     sync();
   }
-  const c = structuredClone({ ...cfg, schedule: [] as number[] });
-  c.schedule = schedule; // shared with the editor, so drawing during the run takes effect live
-  enqueue([makeRun(c)]);
+  const rs: Run[] = [];
+  for (let i = 0; i < numSeeds; i++) {
+    const c = structuredClone({ ...cfg, schedule: [] as number[] });
+    c.schedule = schedule; // shared with the editor, so drawing during the run takes effect live
+    // Consecutive seeds after the first roll, so a press never repeats a seed.
+    c.initSeed = cfg.initSeed + i;
+    c.dataSeed = cfg.dataSeed + i;
+    rs.push(makeRun(c));
+  }
+  enqueue(rs);
 }
 
 function enqueue(rs: Run[]) {

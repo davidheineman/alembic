@@ -220,6 +220,11 @@ button.danger {
   border-color: #7d3138;
 }
 
+.dimmed {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 button:disabled {
   opacity: 0.45;
   cursor: default;
