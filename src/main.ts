@@ -545,9 +545,7 @@ function modelWarnings(): string {
   const w: string[] = [];
   const m = cfg.model;
   const bn = ((m.preNorm && m.norm === 'batchnorm') || (m.postNorm && postNormKind(m) === 'batchnorm')) && m.depth > 0;
-  if (bn && effectiveBatch(cfg) === 1) w.push('BatchNorm with batch size 1 normalizes every feature to 0, so the network output is constant.');
   if (bn && (effectiveBatch(cfg) > 1024 || (cfg.microBatches ?? 0) > 1)) w.push('Batches > 1024 are split into micro-batches; BatchNorm uses per-micro-batch ("ghost") statistics.');
-  if (!m.residual && m.depth > 6 && !m.preNorm && !m.postNorm) w.push('Deep plain (non-residual, un-normalized) MLP: watch for vanishing/exploding signals.');
   return w.join('\n');
 }
 
