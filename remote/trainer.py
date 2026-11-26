@@ -5,6 +5,7 @@ BatchNorm at eval), and optimizer update rules as the WebGPU trainer, so a confi
 the same curves in either backend up to float rounding.
 """
 
+import contextlib
 import json
 import math
 import threading
@@ -572,11 +573,9 @@ def capture(step_fn, state: list[torch.Tensor], opt: "Optimizer", ptr: torch.Ten
         for t, s in zip(state, saved):
             t.copy_(s)
     opt.zero_grad()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-        step_fn()
+    replay = _record(step_fn)
     ptr.zero_()
-    return graph.replay
+    return replay
 
 
 def capture_eval(eval_fn):
@@ -586,9 +585,22 @@ def capture_eval(eval_fn):
     with torch.cuda.stream(side):
         eval_fn()
     torch.cuda.current_stream().wait_stream(side)
+    return _record(eval_fn)
+
+
+def _record(fn):
+    """torch.cuda.graph() without its device-wide synchronize and cache flushes on entry: those wait
+    for every other run's queued chunks and make the next setup re-allocate from scratch."""
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-        eval_fn()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        graph.capture_begin(capture_error_mode="thread_local")
+        try:
+            fn()
+        finally:
+            graph.capture_end()
+    torch.cuda.current_stream().wait_stream(side)
     return graph.replay
 
 
@@ -898,6 +910,7 @@ def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s:
             sess.capture()
         run_step = sess.replay or train_step
         run_eval = sess.eval_replay or sess.eval_step
+        eager = not (sess.replay and sess.eval_replay)
         if cuda:
             torch.cuda.current_stream().synchronize()
     finally:
@@ -980,9 +993,10 @@ def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s:
             nxt = None
             if step < T:
                 k = min(k_steps, T - step, half)
-                # Launching allocates (evals, eager steps), which must not overlap another thread's
-                # capture. It only queues work, so the lock is held briefly.
-                with _gpu_lock:
+                # Eager steps and evals allocate, which must not overlap another thread's capture.
+                # Graph replays, async copies and event records don't, so a run that has its graphs
+                # keeps going while other runs set up (captures are thread_local).
+                with _gpu_lock if eager else contextlib.nullcontext():
                     nxt = launch(step, k, slot)
                 step += k
                 slot ^= 1
