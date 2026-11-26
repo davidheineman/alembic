@@ -40,7 +40,7 @@ const cfg: TrainConfig = {
   batchMode: 'minibatch',
   batchSize: 128,
   budgetUnit: 'epochs',
-  budget: 5,
+  budget: 3,
   schedule,
   initSeed: 0,
   dataSeed: 42,
