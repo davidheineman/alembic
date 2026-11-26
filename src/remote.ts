@@ -242,10 +242,21 @@ type Msg =
   | { type: 'queued' | 'ping' | 'retry' }
   | { type: 'start'; gpu: string }
   | { type: 'update'; step: number; totalSteps: number; train: (number | null)[][]; evals: (number | null)[][]; stepsPerSec: number; diverged: boolean; util?: number }
-  | { type: 'final'; stemW: string }
+  | { type: 'final'; stemW16: string }
   | { type: 'error'; error: string };
 
 const num = (x: number | null) => (x === null ? NaN : x);
+
+function halfToFloat(h: Uint16Array): Float32Array {
+  const out = new Float32Array(h.length);
+  for (let i = 0; i < h.length; i++) {
+    const s = h[i] & 0x8000 ? -1 : 1;
+    const e = (h[i] >> 10) & 0x1f;
+    const f = h[i] & 0x3ff;
+    out[i] = e === 0 ? s * f * 2 ** -24 : e === 31 ? (f ? NaN : s * Infinity) : s * (1 + f / 1024) * 2 ** (e - 15);
+  }
+  return out;
+}
 
 export class RemoteRun {
   private ctrl = new AbortController();
@@ -331,8 +342,8 @@ export class RemoteRun {
               diverged: m.diverged,
             });
           } else if (m.type === 'final') {
-            const bytes = Uint8Array.from(atob(m.stemW), (c) => c.charCodeAt(0));
-            onUpdate({ step, totalSteps: T, train: [], evals: [], stepsPerSec: sps, diverged: false, stemWeights: new Float32Array(bytes.buffer) });
+            const bytes = Uint8Array.from(atob(m.stemW16), (c) => c.charCodeAt(0));
+            onUpdate({ step, totalSteps: T, train: [], evals: [], stepsPerSec: sps, diverged: false, stemWeights: halfToFloat(new Uint16Array(bytes.buffer)) });
           }
         }
       }

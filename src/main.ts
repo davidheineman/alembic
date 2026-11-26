@@ -1648,6 +1648,11 @@ async function executeRemote(r: Run) {
       (u) => {
         pool.touch();
         onUpdate(r, u);
+        // The stem weights still follow, but the run is over once its last step is in.
+        if (u.step >= u.totalSteps && r.status === 'running') {
+          r.status = 'done';
+          requestRender(true);
+        }
       },
       (pct) => pool.setUtil(pct),
     );
@@ -1769,7 +1774,7 @@ function stopAll() {
 
 function stopRemote() {
   for (const [r, rr] of remote) {
-    r.status = 'stopped';
+    if (r.status !== 'done') r.status = 'stopped';
     rr.stop();
   }
 }

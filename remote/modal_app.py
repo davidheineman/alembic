@@ -32,6 +32,20 @@ IDLE_GPU_SHUTDOWN_S = 20  # an unpinned GPU container exits this long after its 
 HEARTBEAT_TIMEOUT_S = 90  # warm GPU is shut down if the browser stops checking in...
 NO_RUNS_TIMEOUT_S = 120  # ...or if nothing has trained for this long, even with the tab open
 MAX_WARMUP_S = 600  # a GPU type that never comes up (e.g. none available) is given up on after this long
+# The browser's default sidebar config, cut to a few steps: each GPU container trains it once at startup.
+WARM_CFG = {
+    "model": {"width": 256, "depth": 3, "mlpRatio": 4, "act": "gelu", "norm": "layernorm", "preNorm": True, "postNorm": False, "residual": True, "init": "kaiming", "zeroInitLast": False},
+    "data": {"resolution": 16, "trainSize": 10000, "testSize": 10000, "flip": False, "crop": False, "cutout": False, "noise": 0, "labelNoise": 0},
+    "opt": {"kind": "adam", "lr": 1e-3, "momentum": 0.9, "beta1": 0.9, "beta2": 0.99, "wd": 0, "clip": 0},
+    "batchMode": "minibatch",
+    "batchSize": 128,
+    "budgetUnit": "steps",
+    "budget": 8,
+    "schedule": [1.0, 1.0],
+    "initSeed": 0,
+    "dataSeed": 0,
+    "numEvals": 2,
+}
 HERE = Path(__file__).parent
 DATA = HERE.parent / "public" / "data"
 
@@ -84,13 +98,24 @@ class WorkerBase:
         import torch
 
         from rng import Sampler, normals
-        from trainer import load_cifar_bins, upload_raw, warm_kernels
+        from trainer import load_cifar_bins, train, upload_raw, warm_kernels
 
         self.raw = load_cifar_bins("/data/cifar10_train.bin", "/data/cifar10_test.bin")
         self.cache = {}
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.raw_gpu = upload_raw(self.raw, self.device) if self.device == "cuda" else None
-        threading.Thread(target=warm_kernels, args=(self.device,), daemon=True).start()
+
+        def warm():
+            # A container's first run otherwise spends ~1.5 s on one-time CUDA/cuBLAS setup before
+            # its first update; this pays it while the browser is still waiting for "ready".
+            warm_kernels(self.device)
+            try:
+                for _ in train(WARM_CFG, self.raw, self.device, self.cache, raw_gpu=self.raw_gpu):
+                    pass
+            except Exception as e:  # noqa: BLE001
+                print(f"warm-up run failed: {type(e).__name__}: {e}")
+
+        threading.Thread(target=warm, daemon=True).start()
         self.gpu_name = torch.cuda.get_device_name() if self.device == "cuda" else "CPU"
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
@@ -170,8 +195,8 @@ class WorkerBase:
             checked = time.time()
             for u in train(cfg, self.raw, self.device, self.cache, raw_gpu=self.raw_gpu):
                 if u.get("final"):
-                    w = u["stemW"]
-                    yield {"type": "final", "stemW": base64.b64encode(w.tobytes()).decode()}
+                    # Only drawn as filter images, so half precision is plenty and halves the last message.
+                    yield {"type": "final", "stemW16": base64.b64encode(u["stemW"].astype("<f2").tobytes()).decode()}
                 else:
                     yield {"type": "update", **u, "util": self.util}
                 if cancelled.is_set() or (stop is not None and stop.is_set()):
