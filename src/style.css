@@ -59,6 +59,15 @@ header {
   font-size: 11px;
 }
 
+.gh {
+  display: flex;
+  color: var(--dim);
+}
+
+.gh:hover {
+  color: var(--text);
+}
+
 aside {
   overflow-y: auto;
   border-right: 1px solid var(--border);
@@ -108,7 +117,7 @@ main {
 
 .row > label:first-child,
 .row > .lbl {
-  width: 78px;
+  width: 84px;
   flex: none;
   color: var(--dim);
 }

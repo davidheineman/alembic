@@ -1,4 +1,5 @@
 // CIFAR-10 loading. Binary format: records of [label(1), R(1024), G(1024), B(1024)].
+import { Rng } from './rng';
 
 export const CLASSES = ['plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck'];
 const REC = 3073;
@@ -128,12 +129,39 @@ function channelStats(px: Uint8Array, n: number, res: number) {
   return { mean, std };
 }
 
+export interface Corruption {
+  noise: number;
+  labelNoise: number;
+  seed: number;
+}
+
+/** Fixed (per-dataset, not per-step) Gaussian pixel noise and label flips, applied in place. */
+function corrupt(px: Uint8Array, labels: Uint32Array, n: number, D: number, c: Corruption) {
+  const rng = new Rng(c.seed, 3);
+  if (c.noise > 0) {
+    const s = c.noise * 255;
+    for (let i = 0; i < n * D; i++) px[i] = Math.max(0, Math.min(255, Math.round(px[i] + s * rng.normal())));
+  }
+  if (c.labelNoise > 0) {
+    const K = CLASSES.length;
+    for (let i = 0; i < n; i++) if (rng.uniform() < c.labelNoise) labels[i] = (labels[i] + 1 + rng.int(K - 1)) % K;
+  }
+}
+
 const gpuCache = new Map<string, GpuDataset>();
 
-export function getGpuDataset(device: GPUDevice, cifar: Cifar, res: number, trainSize: number, testSize: number): GpuDataset {
+export function getGpuDataset(
+  device: GPUDevice,
+  cifar: Cifar,
+  res: number,
+  trainSize: number,
+  testSize: number,
+  corruption: Corruption = { noise: 0, labelNoise: 0, seed: 0 },
+): GpuDataset {
   trainSize = Math.min(trainSize, cifar.train.N);
   testSize = Math.min(testSize, cifar.test.N);
-  const key = `${res}/${trainSize}/${testSize}`;
+  const corrupted = corruption.noise > 0 || corruption.labelNoise > 0;
+  const key = `${res}/${trainSize}/${testSize}` + (corrupted ? `/${corruption.noise}/${corruption.labelNoise}/${corruption.seed}` : '');
   const hit = gpuCache.get(key);
   if (hit) return hit;
   // Keep at most a couple of datasets resident.
@@ -145,15 +173,17 @@ export function getGpuDataset(device: GPUDevice, cifar: Cifar, res: number, trai
     }
     gpuCache.delete(k);
   }
-  const upload = (split: CpuSplit, n: number): { split: GpuSplit; px: Uint8Array } => {
+  const upload = (split: CpuSplit, n: number, c?: Corruption): { split: GpuSplit; px: Uint8Array } => {
     const px = downsample(split, n, res);
+    const lab = Uint32Array.from(split.labels.subarray(0, n));
+    if (c) corrupt(px, lab, n, 3 * res * res, c);
     const data = device.createBuffer({ size: px.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(data, 0, px);
     const labels = device.createBuffer({ size: Math.max(16, n * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(labels, 0, Uint32Array.from(split.labels.subarray(0, n)));
+    device.queue.writeBuffer(labels, 0, lab);
     return { split: { N: n, data, labels }, px };
   };
-  const tr = upload(cifar.train, trainSize);
+  const tr = upload(cifar.train, trainSize, corrupted ? corruption : undefined);
   const te = upload(cifar.test, testSize);
   const { mean, std } = channelStats(tr.px, trainSize, res);
   const ds: GpuDataset = { res, D: 3 * res * res, mean, std, train: tr.split, test: te.split };

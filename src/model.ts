@@ -33,6 +33,8 @@ export interface DataConfig {
   flip: boolean;
   crop: boolean; // random shift by up to res/8 px, zero-padded (= pad-and-crop)
   cutout: boolean; // zero a random (res/2)-sized square
+  noise?: number; // std of fixed Gaussian pixel noise on the train set, in [0, 1] pixel units
+  labelNoise?: number; // fraction of train labels replaced by a random other class
 }
 
 export interface OptConfig {

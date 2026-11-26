@@ -35,7 +35,7 @@ const schedule = presetSchedule('warmup-cosine');
 
 const cfg: TrainConfig = {
   model: { width: 256, depth: 3, mlpRatio: 4, act: 'gelu', norm: 'layernorm', preNorm: true, postNorm: false, residual: true, init: 'kaiming', zeroInitLast: false },
-  data: { resolution: 16, trainSize: 10000, testSize: 10000, flip: false, crop: false, cutout: false },
+  data: { resolution: 16, trainSize: 10000, testSize: 10000, flip: false, crop: false, cutout: false, noise: 0, labelNoise: 0 },
   opt: { kind: 'adam', lr: 1e-3, momentum: 0.9, beta1: 0.9, beta2: 0.99, wd: 0, clip: 0 },
   batchMode: 'minibatch',
   batchSize: 128,
@@ -342,6 +342,8 @@ side.append(
 
 // --- Data
 const EPOCH_STOPS = [0.1, 0.25, 0.5, 1, 2, 3, 5, 10, 20, 30, 50, 100];
+const NOISE_STOPS = [0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1];
+const LABEL_NOISE_STOPS = [0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 const epochRange = h('input', { type: 'range', min: 0, max: EPOCH_STOPS.length - 1, step: 1, class: 'grow' });
 epochRange.addEventListener('input', () => ((cfg.budgetUnit = 'epochs'), (cfg.budget = EPOCH_STOPS[+epochRange.value]), sync()));
 const epochLbl = h('span', { class: 'info', style: 'width:38px;text-align:right' });
@@ -377,8 +379,28 @@ side.append(
       check('crop', () => cfg.data.crop, (v) => (cfg.data.crop = v), 'Random crop: pad by res/8 px (4 px at 32×32), then crop back, i.e. a random shift'),
       check('cutout', () => cfg.data.cutout, (v) => (cfg.data.cutout = v), 'Cutout: blank a random (res/2)×(res/2) square (16×16 at 32×32)'),
     ),
+    row(
+      'Random noise',
+      ...snap(NOISE_STOPS, () => cfg.data.noise ?? 0, (v) => (cfg.data.noise = v), {
+        min: 0,
+        max: 1,
+        title: 'Std of Gaussian noise added once to each training pixel (pixels in [0, 1]); fixed per data seed, test set stays clean',
+      }),
+    ),
+    row(
+      'Label error',
+      ...snap(LABEL_NOISE_STOPS, () => cfg.data.labelNoise ?? 0, (v) => (cfg.data.labelNoise = v), {
+        min: 0,
+        max: 1,
+        title: 'Fraction of training labels replaced by a random wrong class; fixed per data seed, test set stays clean',
+      }),
+    ),
     info(() => `data ${formatCount(cfg.data.trainSize)} · ${formatCount(totalSteps(cfg) * effectiveBatch(cfg))} instances seen`),
-    info(() => (backend === 'remote' && (cfg.data.crop || cfg.data.cutout) ? 'The remote GPU backend only supports flips; crop and cutout are ignored there.' : ''), 'info warn'),
+    info(() => {
+      if (backend !== 'remote') return '';
+      const off = [cfg.data.crop && 'crop', cfg.data.cutout && 'cutout', cfg.data.noise && 'random noise', cfg.data.labelNoise && 'label error'].filter(Boolean);
+      return off.length ? `The remote GPU backend only supports flips; ${off.join(', ')} ${off.length > 1 ? 'are' : 'is'} ignored there.` : '';
+    }, 'info warn'),
   ),
 );
 
@@ -710,9 +732,9 @@ function onConfigChanged() {
 
 const tabsEl = document.getElementById('tabs')!;
 const tabNames: [string, string][] = [
-  ['curves', 'Training curves'],
+  ['curves', 'Main'],
   ['sweep', 'Sweeps'],
-  ['scaling', 'Scaling law'],
+  ['scaling', 'Scaling laws'],
 ];
 let activeTab = 'curves';
 const tabBtns = tabNames.map(([id, label]) => {
@@ -1535,7 +1557,9 @@ function describe(c: TrainConfig): string {
     (m.dropout ? ` drop${m.dropout}` + (DROP_SITES.every((s) => dropAt(m, s)) ? '' : `@${DROP_SITES.filter((s) => dropAt(m, s)).join(',')}`) : '') +
     (c.opt.wd ? ` wd${fmtNum(c.opt.wd)}` : '') +
     (c.precision && c.precision !== 'fp32' ? ` ${c.precision}` : '') +
-    (c.microBatches ? ` μ${c.microBatches}` : '');
+    (c.microBatches ? ` μ${c.microBatches}` : '') +
+    (c.data.noise ? ` noise${fmtNum(c.data.noise)}` : '') +
+    (c.data.labelNoise ? ` lblErr${fmtNum(c.data.labelNoise)}` : '');
   return `d${m.width}×L${m.depth} ${m.actOn === false ? 'noAct' : m.act}${branch} ${norm}${m.residual ? '' : ' noRes'} ${m.init === 'zero' ? '0init' : m.init} ${opt} lr${fmtNum(c.opt.lr)} ${B}${extra}`;
 }
 
@@ -1653,7 +1677,11 @@ async function execute(r: Run) {
   let tr: Trainer;
   let ds: GpuDataset;
   try {
-    ds = getGpuDataset(engine.device, cifar, r.cfg.data.resolution, r.cfg.data.trainSize, r.cfg.data.testSize);
+    ds = getGpuDataset(engine.device, cifar, r.cfg.data.resolution, r.cfg.data.trainSize, r.cfg.data.testSize, {
+      noise: r.cfg.data.noise ?? 0,
+      labelNoise: r.cfg.data.labelNoise ?? 0,
+      seed: r.cfg.dataSeed,
+    });
     tr = new Trainer(engine, ds, r.cfg);
   } catch (e) {
     r.status = 'error';
