@@ -20,13 +20,18 @@ from pathlib import Path
 
 import modal
 
-GPU = os.environ.get("CIFAR_GPU", "L4,A10G,T4,L40S")  # fallback order; "none" = CPU containers
-# Hard cap: never more than one GPU container. Runs beyond RUNS_PER_GPU wait in Modal's queue.
+GPU = os.environ.get("CIFAR_GPU", "L4,A10G,T4,L40S")  # run_cases only; "none" = CPU containers
+# GPU types the browser can pick from; one worker class each (see the bottom of the Worker section).
+GPU_TYPES = ["T4", "L4", "A10G", "L40S", "A100", "H100"]
+DEFAULT_GPU = "A10G"
+# Hard cap: never more than one GPU container per type, and only the selected type is kept warm;
+# switching types shuts the others down. Runs beyond RUNS_PER_GPU wait in Modal's queue.
 MAX_GPUS = 1
 RUNS_PER_GPU = 8
 IDLE_GPU_SHUTDOWN_S = 20  # an unpinned GPU container exits this long after its last run
 HEARTBEAT_TIMEOUT_S = 90  # warm GPU is shut down if the browser stops checking in...
 NO_RUNS_TIMEOUT_S = 120  # ...or if nothing has trained for this long, even with the tab open
+MAX_WARMUP_S = 600  # a GPU type that never comes up (e.g. none available) is given up on after this long
 HERE = Path(__file__).parent
 DATA = HERE.parent / "public" / "data"
 
@@ -68,9 +73,9 @@ auth_secret = modal.Secret.from_name("cifar-remote-auth")
 NO_BUFFERING = {"Content-Encoding": "identity", "Cache-Control": "no-cache, no-transform"}
 
 
-@app.cls(image=gpu_image, gpu=None if GPU == "none" else GPU.split(","), cpu=4 if GPU != "none" else 8, max_containers=MAX_GPUS, scaledown_window=IDLE_GPU_SHUTDOWN_S, timeout=3600, secrets=[auth_secret])
-@modal.concurrent(max_inputs=RUNS_PER_GPU)
-class Worker:
+class WorkerBase:
+    gpu_type = DEFAULT_GPU
+
     @modal.enter()
     def load(self):
         import threading
@@ -116,7 +121,7 @@ class Worker:
             n = 0
             while self.alive:
                 if n % 10 == 0:
-                    state[self.key] = {"t": time.time(), "gpu": self.gpu_name, "active": self.active}
+                    state[self.key] = {"t": time.time(), "gpu": self.gpu_name, "type": self.gpu_type, "started": self.started, "active": self.active}
                 if (state.get("shutdown") or 0) > self.started:
                     modal.experimental.stop_fetching_inputs()
                     self.alive = False
@@ -257,6 +262,56 @@ class Worker:
         return web
 
 
+def worker_cls(gpu: str):
+    return app.cls(image=gpu_image, gpu=gpu, cpu=4, max_containers=MAX_GPUS, scaledown_window=IDLE_GPU_SHUTDOWN_S, timeout=3600, secrets=[auth_secret])
+
+
+# Modal needs each class at module scope under its own name. The A10G one keeps the name `Worker`
+# so its web URL (VITE_REMOTE_TRAIN_URL) is unchanged; the others are at ...-worker<type>-web...
+@worker_cls("A10G")
+@modal.concurrent(max_inputs=RUNS_PER_GPU)
+class Worker(WorkerBase):
+    gpu_type = "A10G"
+
+
+@worker_cls("T4")
+@modal.concurrent(max_inputs=RUNS_PER_GPU)
+class WorkerT4(WorkerBase):
+    gpu_type = "T4"
+
+
+@worker_cls("L4")
+@modal.concurrent(max_inputs=RUNS_PER_GPU)
+class WorkerL4(WorkerBase):
+    gpu_type = "L4"
+
+
+@worker_cls("L40S")
+@modal.concurrent(max_inputs=RUNS_PER_GPU)
+class WorkerL40S(WorkerBase):
+    gpu_type = "L40S"
+
+
+@worker_cls("A100")
+@modal.concurrent(max_inputs=RUNS_PER_GPU)
+class WorkerA100(WorkerBase):
+    gpu_type = "A100"
+
+
+@worker_cls("H100")
+@modal.concurrent(max_inputs=RUNS_PER_GPU)
+class WorkerH100(WorkerBase):
+    gpu_type = "H100"
+
+
+WORKERS = {"T4": WorkerT4, "L4": WorkerL4, "A10G": Worker, "L40S": WorkerL40S, "A100": WorkerA100, "H100": WorkerH100}
+assert list(WORKERS) == GPU_TYPES
+
+
+def pick_gpu(name) -> str:
+    return name if name in WORKERS else DEFAULT_GPU
+
+
 @app.function(image=web_image, secrets=[auth_secret], timeout=3600, scaledown_window=300)
 @modal.concurrent(max_inputs=200)
 @modal.asgi_app()
@@ -289,20 +344,26 @@ def api():
         want = 1 if int(body.get("gpus", 0)) > 0 else 0
         pool = await asyncio.to_thread(state.get, "pool", {}) or {}
         now = time.time()
+        current = pick_gpu(pool.get("gpu"))
+        gpu = pick_gpu(body.get("gpu")) if want else current
         if want and pool.get("released") and not body.get("start"):
             # The reaper released the GPU for inactivity; only an explicit user action re-warms it.
-            return {**(await asyncio.to_thread(pool_status, 0)), "released": True}
+            return {**(await asyncio.to_thread(pool_status, 0)), "released": True, "gpu": gpu}
+        if want and pool.get("want") and gpu != current:
+            # Switching GPU type: stop the old container (and its runs) before pinning the new one.
+            await asyncio.to_thread(shut_down)
+            pool["since"] = now
         if pool.get("want") != want:
             pool["since"] = now
         if want or pool.get("want"):
             # Re-applied on every heartbeat: a redeploy resets min_containers to the decorator's value.
-            await asyncio.to_thread(set_pool, want)
+            await asyncio.to_thread(set_pool, want, gpu)
         if not want and not body.get("leaving"):
             # Leaving (page closed or reloading) only unpins: the container exits IDLE_GPU_SHUTDOWN_S
             # after its last run, and a reloaded page gets it back warm.
             await asyncio.to_thread(shut_down)
-        await asyncio.to_thread(state.put, "pool", {"want": want, "hb": now, "since": pool.get("since", now)})
-        return await asyncio.to_thread(pool_status, want)
+        await asyncio.to_thread(state.put, "pool", {"want": want, "hb": now, "since": pool.get("since", now), "gpu": gpu})
+        return {**(await asyncio.to_thread(pool_status, want)), "gpu": gpu}
 
     @web.get("/status")
     async def status(req: Request):
@@ -324,6 +385,7 @@ def api():
         if req.headers.get("authorization") != f"Bearer {token}" and cfg.pop("token", None) != token:
             raise HTTPException(401, "bad token")
         run_id = cfg.get("runId")
+        worker = WORKERS[pick_gpu(cfg.pop("gpu", None))]
         await asyncio.to_thread(state.put, "lastRun", time.time())
 
         async def stream():
@@ -331,7 +393,7 @@ def api():
 
             async def pump():
                 try:
-                    async for u in Worker().train.remote_gen.aio(cfg):
+                    async for u in worker().train.remote_gen.aio(cfg):
                         await q.put(u)
                 except Exception as e:  # noqa: BLE001
                     await q.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
@@ -363,13 +425,14 @@ def api():
     return web
 
 
-def set_pool(n: int):
-    Worker().update_autoscaler(min_containers=n)
+def set_pool(n: int, gpu: str):
+    WORKERS[gpu]().update_autoscaler(min_containers=n)
 
 
 def shut_down():
-    """Unpins the GPU and tells running workers to exit now instead of after the idle window."""
-    set_pool(0)
+    """Unpins every GPU type and tells running workers to exit now instead of after the idle window."""
+    for g in GPU_TYPES:
+        set_pool(0, g)
     state["shutdown"] = time.time()
 
 
@@ -386,14 +449,23 @@ def reaper():
     pool = state.get("pool", {}) or {}
     if pool.get("want"):
         silent = now - pool.get("hb", 0)
-        active = sum(v.get("active", 0) for k, v in state.items() if k.startswith("w:") and now - v["t"] < 30)
-        idle = 0 if active else now - max(state.get("lastRun", 0) or 0, pool.get("since", 0))
+        live = [v for k, v in state.items() if k.startswith("w:") and now - v["t"] < 30]
+        active = sum(v.get("active", 0) for v in live)
+        up = [v.get("started", 0) for v in live if v.get("type", DEFAULT_GPU) == pick_gpu(pool.get("gpu"))]
+        if not up:
+            # Still cold-starting: that isn't idleness, but give up if the GPU never arrives.
+            idle = 0 if now - pool.get("since", 0) < MAX_WARMUP_S else float("inf")
+        else:
+            idle = 0 if active else now - max(state.get("lastRun", 0) or 0, pool.get("since", 0), min(up))
         if silent > HEARTBEAT_TIMEOUT_S or idle > NO_RUNS_TIMEOUT_S:
             state["pool"] = {"want": 0, "hb": pool.get("hb", 0), "since": now, "released": True}
             shut_down()
             print(f"shut down warm GPU (no heartbeat for {silent:.0f}s, idle for {idle:.0f}s)")
-    if not (state.get("pool", {}) or {}).get("want"):
-        set_pool(0)  # re-asserted every minute in case an earlier release call failed
+    # Re-asserted every minute in case an earlier release call failed: only the selected type may be pinned.
+    pool = state.get("pool", {}) or {}
+    for g in GPU_TYPES:
+        if not pool.get("want") or g != pick_gpu(pool.get("gpu")):
+            set_pool(0, g)
     for k, v in list(state.items()):
         if (k.startswith("w:") and now - v["t"] > 120) or (k.startswith("cancel:") and now - v > 3600):
             state.pop(k)

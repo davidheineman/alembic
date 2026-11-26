@@ -247,6 +247,10 @@ main .seg {
   border-right: 1px solid #333944;
 }
 
+.seg.compact button {
+  padding: 3px 5px;
+}
+
 .seg button:last-child {
   border-right: none;
 }

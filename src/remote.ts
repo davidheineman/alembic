@@ -5,15 +5,31 @@ import type { TrainConfig } from './model';
 
 const URL_ = import.meta.env.VITE_REMOTE_URL as string | undefined;
 const TOKEN = import.meta.env.VITE_REMOTE_TOKEN as string | undefined;
-// The GPU worker's own endpoint (Worker.web); skips the hop through the `api` function.
+// The A10G worker's own endpoint (Worker.web); skips the hop through the `api` function.
 const TRAIN_URL = (import.meta.env.VITE_REMOTE_TRAIN_URL as string | undefined) ?? URL_;
 
 export const remoteAvailable = !!(URL_ && TOKEN);
 
 const headers = { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
 
-// Rough Modal on-demand prices, $/GPU-hour.
-const PRICE: Record<string, number> = { L4: 0.8, A10: 1.1, A10G: 1.1, T4: 0.59, L40S: 1.95 };
+// GPU types offered by remote/modal_app.py (GPU_TYPES) with rough Modal on-demand prices, $/GPU-hour.
+export const GPU_PRICES: Record<string, number> = { T4: 0.59, L4: 0.8, A10G: 1.1, L40S: 1.95, A100: 2.1, H100: 3.95 };
+export const GPU_TYPES = Object.keys(GPU_PRICES);
+const DEFAULT_GPU = 'A10G';
+
+export let remoteGpu = GPU_TYPES.includes(localStorage.getItem('remoteGpu') ?? '') ? localStorage.getItem('remoteGpu')! : DEFAULT_GPU;
+
+/** Each GPU type has its own worker class, served at ...-worker<type>-web... (A10G is plain `worker`). */
+function trainUrl(): string | undefined {
+  if (!TRAIN_URL?.includes('-worker-web')) return TRAIN_URL;
+  return remoteGpu === DEFAULT_GPU ? TRAIN_URL : TRAIN_URL.replace('-worker-web', `-worker${remoteGpu.toLowerCase()}-web`);
+}
+
+/** Whether a CUDA device name ("NVIDIA A100-SXM4-40GB", "Tesla T4") is the given type. */
+function isType(name: string, type: string): boolean {
+  const n = name.replace(/^NVIDIA |^Tesla /, '');
+  return n === type || n.startsWith(type + ' ') || n.startsWith(type + '-');
+}
 
 export interface PoolStatus {
   want: number;
@@ -54,16 +70,31 @@ export class RemotePool {
     if (this.stopping) return 'stopping';
     if (!this.on) return 'off';
     if (this.error) return 'error';
-    return this.status && this.status.ready >= 1 ? 'ready' : 'warming';
+    // Right after switching types the old container may still report in; it doesn't count.
+    return this.status && this.status.ready >= 1 && this.status.gpus.some((g) => isType(g, remoteGpu)) ? 'ready' : 'warming';
   }
 
   get gpuLabel(): string {
-    return this.status?.gpus.map((g) => g.replace(/^NVIDIA |^Tesla /, '')).join('/') ?? '';
+    const g = this.status?.gpus.find((n) => isType(n, remoteGpu));
+    return g ? g.replace(/^NVIDIA |^Tesla /, '') : remoteGpu;
   }
 
   get costPerHour(): number {
-    const g = this.status?.gpus ?? [];
-    return g.length ? Math.max(...g.map((n) => PRICE[n.replace(/^NVIDIA |^Tesla /, '')] ?? 1.1)) : 1.1;
+    return GPU_PRICES[remoteGpu];
+  }
+
+  /** Switches the warm container to another GPU type; runs on the old one are lost. */
+  setGpu(type: string) {
+    if (type === remoteGpu || !GPU_TYPES.includes(type)) return;
+    remoteGpu = type;
+    localStorage.setItem('remoteGpu', type);
+    this.status = null;
+    this.prepSent = '';
+    if (this.on && !this.stopping) {
+      this.explicitStart = true;
+      this.onChange();
+      void this.tick();
+    }
   }
 
   /** explicit=false (e.g. restoring after a page reload) does not override an inactivity shutdown. */
@@ -157,7 +188,7 @@ export class RemotePool {
     if (this.state !== 'ready' || !this.prepBody || this.prepBody === this.prepSent) return;
     const body = this.prepBody;
     this.prepSent = body;
-    void fetch(`${TRAIN_URL}/prepare`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ ...JSON.parse(body), token: TOKEN }) }).catch(() => {
+    void fetch(`${trainUrl()}/prepare`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ ...JSON.parse(body), token: TOKEN }) }).catch(() => {
       if (this.prepSent === body) this.prepSent = '';
     });
   }
@@ -169,13 +200,15 @@ export class RemotePool {
   }
 
   private post(gpus: number, start: boolean): Promise<PoolStatus> {
-    return this.request('/warm', { gpus, start });
+    return this.request('/warm', { gpus, start, gpu: remoteGpu });
   }
 
   private async tick() {
     clearTimeout(this.timer);
     const gen = this.gen;
     if (!this.on) return;
+    // A cold start (slow for some GPU types) doesn't count as idle; the server gives up on it eventually.
+    if (this.state === 'warming') this.touch();
     if (Date.now() - this.lastActive > RemotePool.IDLE_MS && !this.status?.active) {
       this.stop(true);
       return;
@@ -194,7 +227,7 @@ export class RemotePool {
       this.error = '';
       // Keeps the browser's connection to the GPU container open, so pressing Train doesn't pay
       // for a new TCP/TLS handshake.
-      if (st.ready) void fetch(`${TRAIN_URL}/ping`).catch(() => {});
+      if (st.ready) void fetch(`${trainUrl()}/ping`).catch(() => {});
       this.sendPrepare();
     } catch (e) {
       if (gen !== this.gen) return;
@@ -244,12 +277,12 @@ export class RemoteRun {
   private async attempt(onStart: (gpu: string) => void, onUpdate: (u: ChunkUpdate) => void, onUtil?: (pct: number) => void): Promise<boolean> {
     let res: Response;
     try {
-      res = await fetch(`${TRAIN_URL}/train`, {
+      res = await fetch(`${trainUrl()}/train`, {
         method: 'POST',
         // text/plain with the token in the body is a CORS "simple request", so there is no
         // preflight round trip before each run.
         headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({ ...this.cfg, runId: this.id, token: TOKEN }),
+        body: JSON.stringify({ ...this.cfg, runId: this.id, token: TOKEN, gpu: remoteGpu }),
         signal: this.ctrl.signal,
       });
     } catch (e) {
@@ -284,7 +317,15 @@ export class RemoteRun {
             onUpdate({
               step,
               totalSteps: T,
-              train: m.train.map(([s, loss, acc, gnorm, lr]) => ({ step: num(s), loss: num(loss), acc: num(acc), gnorm: num(gnorm), lr: num(lr) })),
+              train: m.train.map(([s, loss, acc, gnorm, lr, pnorm, actMax]) => ({
+                step: num(s),
+                loss: num(loss),
+                acc: num(acc),
+                gnorm: num(gnorm),
+                lr: num(lr),
+                pnorm: pnorm === undefined ? undefined : num(pnorm),
+                actMax: actMax === undefined ? undefined : num(actMax),
+              })),
               evals: m.evals.map(([s, loss, acc]) => ({ step: num(s), loss: num(loss), acc: num(acc) })),
               stepsPerSec: m.stepsPerSec,
               diverged: m.diverged,

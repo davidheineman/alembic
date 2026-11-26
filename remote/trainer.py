@@ -249,6 +249,8 @@ class Model:
     params: dict[str, torch.Tensor] = field(default_factory=dict)
     running: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     precision: str = "fp32"
+    # Max |h| over the residual stream (stem and block outputs) during training forwards; set by the session.
+    act_max: torch.Tensor | None = None
 
     def to(self, device) -> "Model":
         self.params = {k: v.detach().to(device).requires_grad_(True) for k, v in self.params.items()}
@@ -372,7 +374,12 @@ def _forward(model: Model, x: torch.Tensor, train: bool) -> torch.Tensor:
         p_drop = (m.get("dropout") or 0.0) if sites.get(site, True) is not False else 0.0
         return F.dropout(t, p_drop, training=True) if train and p_drop > 0 else t
 
+    def track(h: torch.Tensor):
+        if train and model.act_max is not None:
+            torch.maximum(model.act_max, h.detach().abs().amax().float(), out=model.act_max)
+
     h = drop(torch.addmm(p["stem.b"], x, p["stem.W"]), "stem")
+    track(h)
     for l in range(m["depth"]):
         blk = f"block{l}"
         u = norm_fn(model, blk + ".preNorm", h, train) if m["preNorm"] else h
@@ -384,6 +391,7 @@ def _forward(model: Model, x: torch.Tensor, train: bool) -> torch.Tensor:
         if m["residual"]:
             s = s + h
         h = norm_fn(model, blk + ".postNorm", s, train) if m["postNorm"] else s
+        track(h)
     if m["preNorm"] and not m["postNorm"]:
         h = norm_fn(model, "final.norm", h, train)
     return torch.addmm(p["head.b"], h, p["head.W"])
@@ -656,14 +664,16 @@ def _new_session(model: Model, cfg: dict, ds: Dataset, B: int, micro: list[int],
     k_max = max(2, min(1024, (1 << 22) // B))
     idx_buf = torch.zeros(k_max, B, dtype=torch.int64, device=device)
     sched_buf = torch.ones(2, k_max, device=device)  # rows: lr, optimizer step t
-    stats = torch.zeros(k_max, 3, device=device)
+    stats = torch.zeros(k_max, 5, device=device)  # loss, acc, ‖g‖², ‖θ‖², max |h|
     ptr = torch.zeros(1, dtype=torch.int64, device=device)
+    model.act_max = torch.zeros((), device=device)
 
     def train_step():
         idx = idx_buf.index_select(0, ptr).view(-1)
         lr = sched_buf[0].index_select(0, ptr).view(())
         t = sched_buf[1].index_select(0, ptr).view(())
         opt.zero_grad()
+        model.act_max.zero_()
         loss_sum = torch.zeros((), device=device)
         correct = torch.zeros((), device=device)
         off = 0
@@ -680,7 +690,8 @@ def _new_session(model: Model, cfg: dict, ds: Dataset, B: int, micro: list[int],
         opt.step(lr, t, gn2)
         if pure_bf16:
             bf16_round_(opt.weights())
-        stats.index_copy_(0, ptr, torch.stack([loss_sum / B, correct / B, gn2]).view(1, 3))
+        pn2 = torch.stack(torch._foreach_norm(opt.weights())).pow(2).sum()
+        stats.index_copy_(0, ptr, torch.stack([loss_sum / B, correct / B, gn2, pn2, model.act_max]).view(1, 5))
         ptr.add_(1)
 
     eval_out = torch.zeros(2, device=device)
@@ -709,7 +720,7 @@ def _new_session(model: Model, cfg: dict, ds: Dataset, B: int, micro: list[int],
         ptr=ptr,
         idx_host=torch.zeros(k_max, B, dtype=torch.int64, pin_memory=cuda),
         sched_host=torch.zeros(2, k_max, pin_memory=cuda),
-        stats_host=torch.zeros(k_max, 3, pin_memory=cuda),
+        stats_host=torch.zeros(k_max, 5, pin_memory=cuda),
         train_step=train_step,
         eval_step=eval_step,
         eval_out=eval_out,
@@ -953,7 +964,8 @@ def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s:
         step, k, off = c["step"], c["k"], c["slot"] * half
         st = stats_host[off : off + k].numpy()
         evs = evals_host[c["slot"], : len(c["ev_steps"])].numpy()
-        train_recs = [[step + j + 1, float(st[j, 0]), float(st[j, 1]), math.sqrt(max(0.0, float(st[j, 2]))) if np.isfinite(st[j, 2]) else float("nan"), c["lrs"][j]] for j in range(k)]
+        root = lambda v: math.sqrt(max(0.0, float(v))) if np.isfinite(v) else float("nan")  # noqa: E731
+        train_recs = [[step + j + 1, float(st[j, 0]), float(st[j, 1]), root(st[j, 2]), c["lrs"][j], root(st[j, 3]), float(st[j, 4])] for j in range(k)]
         eval_recs = [[s, float(e[0]), float(e[1])] for s, e in zip(c["ev_steps"], evs)]
         diverged = any(not math.isfinite(r[1]) for r in train_recs) or any(not math.isfinite(r[1]) for r in eval_recs)
         return {"step": step + k, "totalSteps": T, "train": train_recs, "evals": eval_recs, "stepsPerSec": k / max(dt, 1e-6), "diverged": diverged}, dt

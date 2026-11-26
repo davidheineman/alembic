@@ -24,7 +24,7 @@ import { ScheduleEditor, presetSchedule, type Preset } from './ui/schedule';
 import { renderSchematic } from './ui/schematic';
 import { Heatmap } from './ui/heatmap';
 import { hideTip, showTip } from './ui/tooltip';
-import { RemotePool, RemoteRun, remoteAvailable } from './remote';
+import { GPU_PRICES, GPU_TYPES, RemotePool, RemoteRun, remoteAvailable, remoteGpu } from './remote';
 import { SWEEP_PARAMS, parseValues, meanStd, ema, fitPowerLaw, frontier, type PowerFit } from './experiments';
 
 // ============================================================================
@@ -285,6 +285,17 @@ if (remoteAvailable && localStorage.getItem('backend') === 'remote') {
   backend = 'remote';
   pool.start(false);
 }
+const gpuSeg = seg(
+  GPU_TYPES.map((g) => [g, g] as [string, string]),
+  () => remoteGpu,
+  (v) => {
+    stopRemote();
+    pool.setGpu(v);
+    pool.prepare(upcomingConfigs());
+  },
+  Object.fromEntries(GPU_TYPES.map((g) => [g, `~$${GPU_PRICES[g].toFixed(2)}/hr. Switching stops runs on the current GPU.`])),
+);
+gpuSeg.classList.add('compact');
 const runSection = section(
     'Run',
     h('div', { class: 'row' }, trainBtn, stopBtn, h('button', { onclick: () => clearRuns(), title: 'Stop queued and remote runs, then remove all runs' }, 'Clear runs'),
@@ -314,6 +325,11 @@ const runSection = section(
       )),
       remoteAvailable && poolDot,
     ),
+    remoteAvailable &&
+      hideUnless(
+        row('GPU', gpuSeg),
+        () => backend === 'remote',
+      ),
     remoteAvailable && poolInfo,
     h('div', { class: 'progress' }, progressBar),
     liveInfo,
