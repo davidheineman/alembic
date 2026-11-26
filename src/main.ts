@@ -731,7 +731,7 @@ side.append(
 
 /** What the next Train or Run sweep would start: the remote GPU sets these up in advance. */
 function upcomingConfigs(): TrainConfig[] {
-  return [cfg, ...sweepConfigs().slice(0, pool.status?.runsPerGpu ?? 8).map((s) => s.c)];
+  return [cfg, ...sweepConfigs().slice(0, 8).map((s) => s.c)];
 }
 
 function onConfigChanged() {
@@ -1647,6 +1647,7 @@ async function executeRemote(r: Run) {
       },
       (u) => {
         pool.touch();
+        if (r.status === 'queued') r.status = 'running';
         onUpdate(r, u);
         // The stem weights still follow, but the run is over once its last step is in.
         if (u.step >= u.totalSteps && r.status === 'running') {
@@ -1655,6 +1656,10 @@ async function executeRemote(r: Run) {
         }
       },
       (pct) => pool.setUtil(pct),
+      () => {
+        if (r.status === 'running') r.status = 'queued';
+        requestRender(true);
+      },
     );
     if (r.status === 'running' || r.status === 'queued') r.status = 'done';
   } catch (e) {

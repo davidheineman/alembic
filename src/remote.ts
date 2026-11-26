@@ -273,19 +273,20 @@ export class RemoteRun {
   }
 
   /** Resolves when training finishes or is stopped; rejects on server errors. onUtil gets the GPU's
-   * utilization (%) as reported alongside each update. */
-  async run(onStart: (gpu: string) => void, onUpdate: (u: ChunkUpdate) => void, onUtil?: (pct: number) => void): Promise<void> {
+   * utilization (%) as reported alongside each update; onQueued is called if the run waits for GPU
+   * memory after starting. */
+  async run(onStart: (gpu: string) => void, onUpdate: (u: ChunkUpdate) => void, onUtil?: (pct: number) => void, onQueued?: () => void): Promise<void> {
     // A request can land on a GPU container that is shutting down; it says so and the next try
     // reaches (or starts) a fresh one.
     for (let i = 0; i < 5; i++) {
-      if (!(await this.attempt(onStart, onUpdate, onUtil)) || this.stopped) return;
+      if (!(await this.attempt(onStart, onUpdate, onUtil, onQueued)) || this.stopped) return;
       await new Promise((r) => setTimeout(r, 1000));
     }
     throw new Error('remote backend: GPU kept shutting down');
   }
 
   /** True if the run should be resent. */
-  private async attempt(onStart: (gpu: string) => void, onUpdate: (u: ChunkUpdate) => void, onUtil?: (pct: number) => void): Promise<boolean> {
+  private async attempt(onStart: (gpu: string) => void, onUpdate: (u: ChunkUpdate) => void, onUtil?: (pct: number) => void, onQueued?: () => void): Promise<boolean> {
     let res: Response;
     try {
       res = await fetch(`${trainUrl()}/train`, {
@@ -319,6 +320,7 @@ export class RemoteRun {
           const m = JSON.parse(line) as Msg;
           if (m.type === 'retry') return true;
           if (m.type === 'start') onStart(m.gpu);
+          else if (m.type === 'queued') onQueued?.();
           else if (m.type === 'error') throw new Error(`remote backend: ${m.error}`);
           else if (m.type === 'update') {
             step = m.step;

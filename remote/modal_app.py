@@ -5,7 +5,7 @@
 
 The browser POSTs one TrainConfig per run to /train and reads newline-delimited JSON
 updates in the same shape as the WebGPU engine's ChunkUpdate. Everything runs on a single
-GPU container (MAX_GPUS = 1), RUNS_PER_GPU runs at a time.
+GPU container (MAX_GPUS = 1), with as many runs training at once as fit in its memory.
 
 Warm GPU: while "Remote GPUs" is selected the browser POSTs /warm every 30 s, which pins
 min_containers=1 so runs start instantly. The pin is released when the browser switches back
@@ -25,9 +25,11 @@ GPU = os.environ.get("CIFAR_GPU", "L4,A10G,T4,L40S")  # run_cases only; "none" =
 GPU_TYPES = ["T4", "L4", "A10G", "L40S", "A100", "H100"]
 DEFAULT_GPU = "A10G"
 # Hard cap: never more than one GPU container per type, and only the selected type is kept warm;
-# switching types shuts the others down. Runs beyond RUNS_PER_GPU wait in Modal's queue.
+# switching types shuts the others down.
 MAX_GPUS = 1
-RUNS_PER_GPU = 8
+# Runs accepted per container. The trainer starts as many as fit in GPU memory and holds the rest
+# (streaming {"type": "queued"}) until memory frees up; beyond this, runs wait in Modal's queue.
+RUNS_PER_GPU = 256
 IDLE_GPU_SHUTDOWN_S = 20  # an unpinned GPU container exits this long after its last run
 HEARTBEAT_TIMEOUT_S = 90  # warm GPU is shut down if the browser stops checking in...
 NO_RUNS_TIMEOUT_S = 120  # ...or if nothing has trained for this long, even with the tab open
@@ -197,6 +199,8 @@ class WorkerBase:
                 if u.get("final"):
                     # Only drawn as filter images, so half precision is plenty and halves the last message.
                     yield {"type": "final", "stemW16": base64.b64encode(u["stemW"].astype("<f2").tobytes()).decode()}
+                elif u.get("waiting"):
+                    yield {"type": "queued"}
                 else:
                     yield {"type": "update", **u, "util": self.util}
                 if cancelled.is_set() or (stop is not None and stop.is_set()):

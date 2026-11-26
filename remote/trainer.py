@@ -26,6 +26,48 @@ REC = 3073
 _gpu_lock = threading.Lock()
 
 
+class _ReplayGate:
+    """Graph replays may run concurrently with each other and with setup work, but not while any
+    thread is recording a graph: recording flags the CUDA RNG state that every replay checks."""
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.replays = 0
+        self.recording = False
+        self.waiting = 0
+
+    @contextlib.contextmanager
+    def replay(self):
+        with self.cv:
+            while self.recording or self.waiting:
+                self.cv.wait()
+            self.replays += 1
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.replays -= 1
+                self.cv.notify_all()
+
+    @contextlib.contextmanager
+    def record(self):
+        with self.cv:
+            self.waiting += 1
+            while self.recording or self.replays:
+                self.cv.wait()
+            self.waiting -= 1
+            self.recording = True
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.recording = False
+                self.cv.notify_all()
+
+
+_replay_gate = _ReplayGate()
+
+
 # ---------------------------------------------------------------------------
 # Data
 
@@ -562,7 +604,7 @@ class Optimizer:
 def capture(step_fn, state: list[torch.Tensor], opt: "Optimizer", ptr: torch.Tensor):
     """Records one training step as a CUDA graph. Warm-up iterations are rolled back afterwards."""
     saved = [t.detach().clone() for t in state]
-    side = torch.cuda.Stream()
+    side = torch.cuda.Stream(priority=-1)
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         for _ in range(2):
@@ -580,7 +622,7 @@ def capture(step_fn, state: list[torch.Tensor], opt: "Optimizer", ptr: torch.Ten
 
 def capture_eval(eval_fn):
     """Eager evals cost ~2 ms of host time each (under _gpu_lock), which held back every other run."""
-    side = torch.cuda.Stream()
+    side = torch.cuda.Stream(priority=-1)
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         eval_fn()
@@ -590,16 +632,21 @@ def capture_eval(eval_fn):
 
 def _record(fn):
     """torch.cuda.graph() without its device-wide synchronize and cache flushes on entry: those wait
-    for every other run's queued chunks and make the next setup re-allocate from scratch."""
+    for every other run's queued chunks and make the next setup re-allocate from scratch. Records on
+    a normal-priority stream, since captured kernels keep the priority they were recorded at."""
     graph = torch.cuda.CUDAGraph()
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
+    with torch.cuda.stream(side), _replay_gate.record():
         graph.capture_begin(capture_error_mode="thread_local")
         try:
             fn()
-        finally:
-            graph.capture_end()
+        except BaseException:
+            # Ends the capture, which then fails; the original error (e.g. out of memory) matters.
+            with contextlib.suppress(Exception):
+                graph.capture_end()
+            raise
+        graph.capture_end()
     torch.cuda.current_stream().wait_stream(side)
     return graph.replay
 
@@ -652,6 +699,43 @@ _MAX_SESSIONS = 24
 def _take_session(key: str) -> Session | None:
     idle = _sessions.get(key)
     return idle.pop() if idle else None
+
+
+def _upload(fresh: Model, device) -> Model:
+    """A GPU copy of a CPU-initialized model. Only the allocation holds _gpu_lock: copies from host
+    memory queue behind other runs' transfers (up to ~1 s with a busy GPU), and in the lock they
+    held back every run setting up after this one."""
+    tensors = list(fresh.params.values()) + [t for pair in fresh.running.values() for t in pair]
+    # One pinned buffer goes over in one transfer; pageable copies are split into many small ones,
+    # each of which can wait behind other runs' transfers.
+    host = torch.cat([t.reshape(-1) for t in tensors])
+    with _gpu_lock:
+        host = host.pin_memory()
+        flat = torch.empty_like(host, device=device)
+    flat.copy_(host, non_blocking=True)
+    torch.cuda.current_stream().synchronize()
+    views = iter(v.view(t.shape) for v, t in zip(flat.split([t.numel() for t in tensors]), tensors))
+    params = {k: next(views).detach().requires_grad_(True) for k in fresh.params}
+    running = {k: (next(views).clone(), next(views).clone()) for k in fresh.running}
+    return Model(fresh.cfg, fresh.in_dim, params, running, fresh.precision)
+
+
+_run_ended = threading.Condition()  # notified whenever a run releases its session
+_running = 0  # runs past setup, under _gpu_lock
+
+
+def _evict_idle_session() -> bool:
+    """Frees the oldest idle session's memory for a run that doesn't fit. False if there is none."""
+    with _gpu_lock:
+        key = next((k for k, v in _sessions.items() if v), None)
+        if key is None:
+            return False
+        _sessions[key].pop(0)
+        _live[key] -= 1
+        if not _sessions[key]:
+            del _sessions[key]
+        torch.cuda.empty_cache()
+    return True
 
 
 def _put_session(key: str, sess: Session):
@@ -865,56 +949,89 @@ def prepare(want: list[tuple[dict, int]], raw, device, ds_cache: dict | None = N
 
 
 def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s: float = 0.05, use_graphs: bool = True, raw_gpu=None) -> Iterator[dict]:
-    """Yields engine-style ChunkUpdates: {step, totalSteps, train, evals, stepsPerSec, diverged}.
+    """Yields engine-style ChunkUpdates: {step, totalSteps, train, evals, stepsPerSec, diverged}, and
+    {"waiting": True} once if the run has to wait for GPU memory.
 
     Several runs may share a GPU from different threads, each on its own stream. Setup (allocation,
     init, graph capture) is not safe while another thread is capturing, so it happens under _gpu_lock;
-    the training loop only uses graph replays, async copies to pinned memory and event waits, which
-    are. Must be iterated from a single thread (the stream is thread-local). Concurrent runs are only
-    bit-identical to solo runs with CUBLAS_WORKSPACE_CONFIG=:0:0 (see modal_app.py).
+    the training loop only uses graph replays (kept apart from recording by _replay_gate), async
+    copies to pinned memory and event waits, which are. Must be iterated from a single thread (the
+    stream is thread-local). Concurrent runs are only bit-identical to solo runs with
+    CUBLAS_WORKSPACE_CONFIG=:0:0 (see modal_app.py).
     """
+    global _running
     cuda = device == "cuda"
     # Generating the initial weights is ~15 ms of CPU; outside the lock, concurrent runs do it in parallel.
     fresh = init_model(cfg["model"], 3 * cfg["data"]["resolution"] ** 2, cfg["initSeed"], "cpu")
-    with _waiting:
-        _gpu_lock.acquire()
-    try:
-        if cuda:
-            torch.cuda.set_stream(torch.cuda.Stream())
-        ds = _dataset(cfg, raw, device, ds_cache, raw_gpu)
-        cfg = {**cfg, "data": {**cfg["data"], "trainSize": ds.n_train, "testSize": ds.n_test}}
-        skey, B, micro, precision = _session_key(cfg, ds)
-        pure_bf16 = precision == "bf16"
-        T = total_steps(cfg)
-        sampler = Sampler(ds.n_train, cfg["dataSeed"], cfg["data"]["flip"])
-        eval_steps = set(eval_schedule(T, cfg["numEvals"], bool(cfg.get("logEvals"))))
-        evals_host = torch.zeros(2, len(eval_steps), 2, pin_memory=cuda)
-        evals_dev = torch.zeros(2, len(eval_steps), 2, device=device)
+    if cuda:
+        # Setup's kernels (copies, warm-up steps before capture) run at high priority, so they don't
+        # queue behind every other run's chunks. Training then uses a normal stream.
+        torch.cuda.set_stream(torch.cuda.Stream(priority=-1))
+    # As many runs train at once as fit in GPU memory. Only setup allocates (replays reuse their
+    # graph's memory), so a run that doesn't fit frees idle sessions or waits for a run to finish.
+    waited = False
+    while True:
+        sess = evals_dev = None
+        fits = False
+        try:
+            init = _upload(fresh, device) if cuda else fresh
+            with _waiting:
+                _gpu_lock.acquire()
+            try:
+                ds = _dataset(cfg, raw, device, ds_cache, raw_gpu)
+                cfg = {**cfg, "data": {**cfg["data"], "trainSize": ds.n_train, "testSize": ds.n_test}}
+                skey, B, micro, precision = _session_key(cfg, ds)
+                T = total_steps(cfg)
+                eval_steps = set(eval_schedule(T, cfg["numEvals"], bool(cfg.get("logEvals"))))
+                evals_host = torch.zeros(2, len(eval_steps), 2, pin_memory=cuda)
+                evals_dev = torch.zeros(2, len(eval_steps), 2, device=device)
+                sess = _take_session(skey) if cuda and use_graphs else None
+                if sess is None:
+                    sess = _new_session(init, cfg, ds, B, micro, precision, device)
+                    _live[skey] = _live.get(skey, 0) + 1
+                else:
+                    sess.reset(init)
+                if precision == "bf16":
+                    bf16_round_(sess.opt.weights())
+                # Captured before the first step: eager steps can differ from graph replays in the
+                # last bit, and a run must not depend on whether its session was new or reused.
+                if cuda and use_graphs and sess.replay is None:
+                    sess.capture()
+                fits = True
+                _running += 1
+            finally:
+                _gpu_lock.release()
+        except torch.cuda.OutOfMemoryError:
+            if sess is not None:
+                with _gpu_lock:
+                    _live[skey] -= 1
+        if fits:
+            break
+        sess = evals_dev = evals_host = init = None
+        if not _evict_idle_session():
+            if not _running:
+                raise torch.cuda.OutOfMemoryError("this model doesn't fit in GPU memory")
+            if not waited:
+                waited = True
+                yield {"waiting": True}
+            with _run_ended:
+                _run_ended.wait(1.0)
 
-        sess = _take_session(skey) if cuda and use_graphs else None
-        if sess is None:
-            sess = _new_session(fresh.to(device), cfg, ds, B, micro, precision, device)
-            _live[skey] = _live.get(skey, 0) + 1
-        else:
-            sess.reset(fresh)
-        sess.stream = torch.cuda.current_stream() if cuda else None
-        if pure_bf16:
-            bf16_round_(sess.opt.weights())
-        model, k_max = sess.model, sess.k_max
-        idx_buf, sched_buf, stats, ptr = sess.idx_buf, sess.sched_buf, sess.stats, sess.ptr
-        idx_host, sched_host, stats_host = sess.idx_host, sess.sched_host, sess.stats_host
-        train_step = sess.train_step
-        # Captured before the first step: eager steps can differ from graph replays in the last bit,
-        # and a run must not depend on whether its session was new or reused.
-        if cuda and use_graphs and sess.replay is None:
-            sess.capture()
-        run_step = sess.replay or train_step
-        run_eval = sess.eval_replay or sess.eval_step
-        eager = not (sess.replay and sess.eval_replay)
-        if cuda:
-            torch.cuda.current_stream().synchronize()
-    finally:
-        _gpu_lock.release()
+    sampler = Sampler(ds.n_train, cfg["dataSeed"], cfg["data"]["flip"])
+    if cuda:
+        # Training waits for setup's kernels on the GPU; waiting on the host, under the lock, held
+        # back the next run's setup for as long as those took on a busy GPU (up to ~1 s).
+        setup_stream = torch.cuda.current_stream()
+        torch.cuda.set_stream(torch.cuda.Stream())
+        torch.cuda.current_stream().wait_stream(setup_stream)
+    sess.stream = torch.cuda.current_stream() if cuda else None
+    model, k_max = sess.model, sess.k_max
+    idx_buf, sched_buf, stats, ptr = sess.idx_buf, sess.sched_buf, sess.stats, sess.ptr
+    idx_host, sched_host, stats_host = sess.idx_host, sess.sched_host, sess.stats_host
+    train_step = sess.train_step
+    run_step = sess.replay or train_step
+    run_eval = sess.eval_replay or sess.eval_step
+    exclusive = not (sess.replay and sess.eval_replay) or (cfg["model"].get("dropout") or 0) > 0
 
     sched = cfg["schedule"]
     base_lr = cfg["opt"]["lr"]
@@ -993,10 +1110,9 @@ def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s:
             nxt = None
             if step < T:
                 k = min(k_steps, T - step, half)
-                # Eager steps and evals allocate, which must not overlap another thread's capture.
-                # Graph replays, async copies and event records don't, so a run that has its graphs
-                # keeps going while other runs set up (captures are thread_local).
-                with _gpu_lock if eager else contextlib.nullcontext():
+                # Eager steps allocate, and replays with dropout advance the shared CUDA RNG state,
+                # so those take the lock. Other replays only have to avoid graph recording.
+                with _gpu_lock if exclusive else _replay_gate.replay():
                     nxt = launch(step, k, slot)
                 step += k
                 slot ^= 1
@@ -1025,3 +1141,7 @@ def train(cfg: dict, raw, device, ds_cache: dict | None = None, target_update_s:
         else:
             with _gpu_lock:
                 _live[skey] -= 1
+        with _gpu_lock:
+            _running -= 1
+        with _run_ended:
+            _run_ended.notify_all()
